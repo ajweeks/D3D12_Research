@@ -44,17 +44,25 @@ void Graphics::Initialize(HWND window)
 	InitD3D();
 	InitializeAssets();
 
-	m_FrameTimes.resize(256);
+	m_FrameTimes.resize(60*3);
 
 	m_CameraPosition = Vector3(0, 100, -15);
 	m_CameraRotation = Quaternion::CreateFromYawPitchRoll(XM_PIDIV4, XM_PIDIV4, 0);
 
-	m_Lights.resize(20);
+	m_Lights.resize(512);
 	for (int i = 0; i < m_Lights.size(); ++i)
 	{
 		Vector4 color = Vector4(RandomRange(0, 1), RandomRange(0, 1), RandomRange(0, 1), 1);
 		color.Normalize(color);
-		m_Lights[i] = Light::Point(Vector3(RandomRange(-200, 200), RandomRange(0, 400), RandomRange(-200, 200)), 120.0f, 1.0f, 0.5f, color);
+		int type = rand() % 2;
+		if (type == 0)
+		{
+			m_Lights[i] = Light::Point(Vector3(RandomRange(-200, 200), RandomRange(10, 50), RandomRange(-200, 200)), 15.0f, 1.0f, 0.5f, color);
+		}
+		else
+		{
+			m_Lights[i] = Light::Cone(Vector3(RandomRange(-200, 200), RandomRange(20, 60), RandomRange(-200, 200)), 40.0f, Vector3(0, -1, 0), 60.0f, 1.0f, 0.5f, color);
+		}
 	}
 }
 
@@ -99,9 +107,148 @@ void Graphics::Update()
 	Matrix cameraProjection = XMMatrixPerspectiveFovLH(XM_PIDIV4, (float)m_WindowWidth / m_WindowHeight, 1.0f, 300);
 	Matrix cameraViewProjection = cameraView * cameraProjection;
 
-
 	BeginFrame();
+
 	uint64 nextFenceValue = 0;
+	uint64 lightCullingFence = 0;
+	uint64 clearLightIndexFence = 0;
+	uint64 shadowsFence = 0;
+	uint64 depthPrepassFence = 0;
+
+	//Reset light index counter
+	{
+		GraphicsCommandContext* pContext = (GraphicsCommandContext*)AllocateCommandContext(D3D12_COMMAND_LIST_TYPE_DIRECT);
+		pContext->MarkBegin(L"Reset Light Index Counter");
+		uint32 zero = 0;
+		m_pLightIndexCounterBuffer->SetData(pContext, &zero, sizeof(uint32));
+		pContext->MarkEnd();
+		clearLightIndexFence = pContext->Execute(false);
+	}
+
+	//Depth prepass
+	{
+		GraphicsCommandContext* pContext = (GraphicsCommandContext*)AllocateCommandContext(D3D12_COMMAND_LIST_TYPE_DIRECT);
+		pContext->MarkBegin(L"Depth Prepass");
+		pContext->SetPipelineState(m_pDepthPrepassPipelineStateObject.get());
+		pContext->SetGraphicsRootSignature(m_pDepthPrepassRootSignature.get());
+		
+		pContext->SetViewport(FloatRect(0, 0, (float)m_WindowWidth, (float)m_WindowHeight));
+		pContext->SetScissorRect(FloatRect(0, 0, (float)m_WindowWidth, (float)m_WindowHeight));
+
+		pContext->SetDepthOnlyTarget(GetDepthStencil()->GetRTV());
+
+		Color clearColor = Color(0.1f, 0.1f, 0.1f, 1.0f);
+		pContext->ClearDepth(GetDepthStencil()->GetRTV(), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0);
+
+		pContext->SetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+		struct PerObjectData
+		{
+			Matrix WorldViewProjection;
+		} ObjectData;
+		ObjectData.WorldViewProjection = cameraViewProjection;
+		pContext->SetDynamicConstantBufferView(0, &ObjectData, sizeof(PerObjectData));
+		for (int i = 0; i < m_pMesh->GetMeshCount(); ++i)
+		{
+			m_pMesh->GetMesh(i)->Draw(pContext);
+		}
+
+		if (m_SampleCount > 1)
+		{
+			pContext->InsertResourceBarrier(GetResolvedDepthStencil(), D3D12_RESOURCE_STATE_RESOLVE_DEST, false);
+			pContext->InsertResourceBarrier(GetDepthStencil(), D3D12_RESOURCE_STATE_RESOLVE_SOURCE, true);
+			pContext->GetCommandList()->ResolveSubresource(GetResolvedDepthStencil()->GetResource(), 0, GetDepthStencil()->GetResource(), 0, DXGI_FORMAT_R24_UNORM_X8_TYPELESS);
+			pContext->InsertResourceBarrier(GetResolvedDepthStencil(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, false);
+			pContext->InsertResourceBarrier(GetDepthStencil(), D3D12_RESOURCE_STATE_DEPTH_WRITE, true);
+		}
+
+		pContext->MarkEnd();
+		depthPrepassFence = pContext->Execute(false);
+	}
+
+	//Frustum generation
+	if(m_FrustumsDirty)
+	{
+		m_FrustumsDirty = false;
+		ComputeCommandContext* pContext = (ComputeCommandContext*)AllocateCommandContext(D3D12_COMMAND_LIST_TYPE_COMPUTE);
+		pContext->MarkBegin(L"Frustum Generation");
+		pContext->SetPipelineState(m_pComputeGenerateFrustumsPipeline.get());
+		pContext->SetComputeRootSignature(m_pComputeGenerateFrustumsRootSignature.get());
+
+#pragma pack(push)
+#pragma pack(16) 
+		struct ShaderParameters
+		{
+			Matrix ProjectionInverse;
+			Vector2 ScreenDimensions;
+			Vector2 padding;
+			uint32 NumThreadGroups[4];
+			uint32 NumThreads[4];
+		} Data;
+#pragma pack(pop)
+
+		int frustumCountX = (int)(ceil((float)m_WindowWidth / FORWARD_PLUS_BLOCK_SIZE));
+		int frustumCountY = (int)(ceil((float)m_WindowHeight / FORWARD_PLUS_BLOCK_SIZE));
+
+		cameraProjection.Invert(Data.ProjectionInverse);
+		Data.ScreenDimensions.x = (float)m_WindowWidth;
+		Data.ScreenDimensions.y = (float)m_WindowHeight;
+		Data.NumThreadGroups[0] = (uint32)ceil((float)frustumCountX / FORWARD_PLUS_BLOCK_SIZE);
+		Data.NumThreadGroups[1] = (uint32)ceil((float)frustumCountY / FORWARD_PLUS_BLOCK_SIZE);
+		Data.NumThreadGroups[2] = 1;
+		Data.NumThreads[0] = frustumCountX;
+		Data.NumThreads[1] = frustumCountY;
+		Data.NumThreads[2] = 1;
+
+		pContext->SetDynamicDescriptor(1, 0, m_pFrustumsBuffer->GetUAV());
+		pContext->SetDynamicConstantBufferView(0, &Data, sizeof(ShaderParameters));
+
+		pContext->Dispatch(Data.NumThreadGroups[0], Data.NumThreadGroups[1], Data.NumThreadGroups[2]);
+		pContext->MarkEnd();
+		pContext->Execute(false);
+	}
+
+	m_CommandQueues[D3D12_COMMAND_LIST_TYPE_COMPUTE]->InsertWaitForFence(clearLightIndexFence);
+	m_CommandQueues[D3D12_COMMAND_LIST_TYPE_COMPUTE]->InsertWaitForFence(depthPrepassFence);
+
+	//Light culling
+	{
+		ComputeCommandContext* pContext = (ComputeCommandContext*)AllocateCommandContext(D3D12_COMMAND_LIST_TYPE_COMPUTE);
+		pContext->MarkBegin(L"Light Culling");
+		pContext->SetPipelineState(m_pComputeLightCullPipeline.get());
+		pContext->SetComputeRootSignature(m_pComputeLightCullRootSignature.get());
+
+#pragma pack(push)
+#pragma pack(16) 
+		struct ShaderParameters
+		{
+			Matrix CameraView;
+			uint32 NumThreadGroups[4];
+			Matrix ProjectionInverse;
+		} Data;
+#pragma pack(pop)
+
+		int frustumCountX = (int)(ceil((float)m_WindowWidth / FORWARD_PLUS_BLOCK_SIZE));
+		int frustumCountY = (int)(ceil((float)m_WindowHeight / FORWARD_PLUS_BLOCK_SIZE));
+
+		Data.CameraView = cameraView;
+		Data.NumThreadGroups[0] = frustumCountX;
+		Data.NumThreadGroups[1] = frustumCountY;
+		Data.NumThreadGroups[2] = 1;
+		cameraProjection.Invert(Data.ProjectionInverse);
+
+		pContext->SetDynamicConstantBufferView(0, &Data, sizeof(ShaderParameters));
+		pContext->SetDynamicConstantBufferView(1, m_Lights.data(), sizeof(Light) * (uint32)m_Lights.size());
+		pContext->SetDynamicDescriptor(2, 0, m_pLightIndexCounterBuffer->GetUAV());
+		pContext->SetDynamicDescriptor(2, 1, m_pLightIndexListBuffer->GetUAV());
+		pContext->SetDynamicDescriptor(2, 2, m_pLightGrid->GetUAV());
+		pContext->SetDynamicDescriptor(3, 0, m_pFrustumsBuffer->GetSRV());
+		pContext->SetDynamicDescriptor(3, 1, GetResolvedDepthStencil()->GetSRV());
+
+		pContext->Dispatch(Data.NumThreadGroups[0], Data.NumThreadGroups[1], Data.NumThreadGroups[2]);
+		pContext->MarkEnd();
+		lightCullingFence = pContext->Execute(false);
+	}
 
 	//Shadow Map
 	{
@@ -110,13 +257,12 @@ void Graphics::Update()
 		pContext->SetPipelineState(m_pShadowsPipelineStateObject.get());
 		pContext->SetGraphicsRootSignature(m_pShadowsRootSignature.get());
 
-		pContext->SetViewport(FloatRect(0, 0, m_pShadowMap->GetWidth(), m_pShadowMap->GetHeight()));
-		pContext->SetScissorRect(FloatRect(0, 0, m_pShadowMap->GetWidth(), m_pShadowMap->GetHeight()));
+		pContext->SetViewport(FloatRect(0, 0, (float)m_pShadowMap->GetWidth(), (float)m_pShadowMap->GetHeight()));
+		pContext->SetScissorRect(FloatRect(0, 0, (float)m_pShadowMap->GetWidth(), (float)m_pShadowMap->GetHeight()));
 
 		pContext->InsertResourceBarrier(m_pShadowMap.get(), D3D12_RESOURCE_STATE_DEPTH_WRITE, true);
-		pContext->SetRenderTargets(nullptr, m_pShadowMap->GetRTV());
+		pContext->SetDepthOnlyTarget(m_pShadowMap->GetRTV());
 
-		Color clearColor = Color(0.1f, 0.1f, 0.1f, 1.0f);
 		pContext->ClearDepth(m_pShadowMap->GetRTV(), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0);
 
 		pContext->SetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -134,8 +280,10 @@ void Graphics::Update()
 
 		pContext->InsertResourceBarrier(m_pShadowMap.get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, true);
 		pContext->MarkEnd();
-		pContext->Execute(false);
+		shadowsFence = pContext->Execute(false);
 	}
+
+	m_CommandQueues[D3D12_COMMAND_LIST_TYPE_DIRECT]->InsertWaitForFence(lightCullingFence);
 
 	//3D
 	{
@@ -147,13 +295,14 @@ void Graphics::Update()
 		pContext->SetViewport(m_Viewport);
 		pContext->SetScissorRect(m_ScissorRect);
 
-		pContext->InsertResourceBarrier(GetCurrentRenderTarget(), D3D12_RESOURCE_STATE_RENDER_TARGET, true);
+		pContext->InsertResourceBarrier(GetCurrentRenderTarget(), D3D12_RESOURCE_STATE_RENDER_TARGET, false);
+		pContext->InsertResourceBarrier(m_pLightGrid.get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, false);
+		pContext->InsertResourceBarrier(m_pLightIndexListBuffer.get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, true);
 
-		pContext->SetRenderTargets(&GetCurrentRenderTarget()->GetRTV(), GetDepthStencilView()->GetRTV());
+		pContext->SetRenderTarget(GetCurrentRenderTarget()->GetRTV(), GetDepthStencil()->GetRTV());
 
 		Color clearColor = Color(0, 0, 0, 1);
 		pContext->ClearRenderTarget(GetCurrentRenderTarget()->GetRTV(), clearColor);
-		pContext->ClearDepth(GetDepthStencilView()->GetRTV(), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0);
 
 		pContext->SetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
@@ -167,8 +316,10 @@ void Graphics::Update()
 
 		pContext->SetDynamicConstantBufferView(0, &ObjectData, sizeof(PerObjectData));
 		pContext->SetDynamicConstantBufferView(1, &frameData, sizeof(PerFrameData));
-		pContext->SetDynamicConstantBufferView(2, m_Lights.data(), sizeof(Light) * m_Lights.size());
+		pContext->SetDynamicConstantBufferView(2, m_Lights.data(), sizeof(Light) * (uint32)m_Lights.size());
 		pContext->SetDynamicDescriptor(4, 0, m_pShadowMap->GetSRV());
+		pContext->SetDynamicDescriptor(4, 1, m_pLightGrid->GetSRV());
+		pContext->SetDynamicDescriptor(4, 2, m_pLightIndexListBuffer->GetSRV());
 		for (int i = 0; i < m_pMesh->GetMeshCount(); ++i)
 		{
 			SubMesh* pSubMesh = m_pMesh->GetMesh(i);
@@ -179,15 +330,19 @@ void Graphics::Update()
 			pSubMesh->Draw(pContext);
 		}
 		pContext->MarkEnd();
+
+		pContext->InsertResourceBarrier(m_pLightGrid.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, false);
+		pContext->InsertResourceBarrier(m_pLightIndexListBuffer.get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+
 		pContext->Execute(false);
 	}
 
-	UpdateImGui();
 
 	GraphicsCommandContext* pContext = (GraphicsCommandContext*)AllocateCommandContext(D3D12_COMMAND_LIST_TYPE_DIRECT);
 	pContext->MarkBegin(L"UI");
-	////UI
+	//UI
 	{
+		UpdateImGui();
 		m_pImGuiRenderer->Render(*pContext);
 	}
 	pContext->MarkEnd();
@@ -307,7 +462,7 @@ void Graphics::InitD3D()
 	{
 		m_DescriptorHeaps[i] = std::make_unique<DescriptorAllocator>(m_pDevice.Get(), (D3D12_DESCRIPTOR_HEAP_TYPE)i);
 	}
-	m_pDynamicCpuVisibleAllocator = std::make_unique<DynamicResourceAllocator>(this, true, 0x20000);
+	m_pDynamicCpuVisibleAllocator = std::make_unique<DynamicResourceAllocator>(this, true, 0x400000);
 
 	m_pSwapchain.Reset();
 
@@ -349,7 +504,13 @@ void Graphics::InitD3D()
 			m_MultiSampleRenderTargets[i] = std::make_unique<Texture2D>();
 		}
 	}
-	m_pDepthStencilBuffer = std::make_unique<Texture2D>();
+	m_pFrustumsBuffer = std::make_unique<StructuredBuffer>();
+	m_pLightGrid = std::make_unique<Texture2D>();
+	m_pDepthStencil = std::make_unique<Texture2D>();
+	if (m_SampleCount > 1)
+	{
+		m_pResolvedDepthStencil = std::make_unique<Texture2D>();
+	}
 
 	OnResize(m_WindowWidth, m_WindowHeight);
 
@@ -367,7 +528,7 @@ void Graphics::OnResize(int width, int height)
 	{
 		m_RenderTargets[i]->Release();
 	}
-	m_pDepthStencilBuffer->Release();
+	m_pDepthStencil->Release();
 
 	//Resize the buffers
 	HR(m_pSwapchain->ResizeBuffers(
@@ -391,7 +552,21 @@ void Graphics::OnResize(int width, int height)
 			m_MultiSampleRenderTargets[i]->Create(this, width, height, RENDER_TARGET_FORMAT, TextureUsage::RenderTarget, m_SampleCount);
 		}
 	}
-	m_pDepthStencilBuffer->Create(this, width, height, DEPTH_STENCIL_FORMAT, TextureUsage::DepthStencil, m_SampleCount);
+	if (m_SampleCount > 1)
+	{
+		m_pDepthStencil->Create(this, width, height, DEPTH_STENCIL_FORMAT, TextureUsage::DepthStencil, m_SampleCount);
+		m_pResolvedDepthStencil->Create(this, width, height, DEPTH_STENCIL_FORMAT, TextureUsage::DepthStencil | TextureUsage::ShaderResource, 1);
+	}
+	else
+	{
+		m_pDepthStencil->Create(this, width, height, DEPTH_STENCIL_FORMAT, TextureUsage::DepthStencil | TextureUsage::ShaderResource, m_SampleCount);
+	}
+
+	int frustumCountX = (int)(ceil((float)width / FORWARD_PLUS_BLOCK_SIZE));
+	int frustumCountY = (int)(ceil((float)height / FORWARD_PLUS_BLOCK_SIZE));
+	m_pFrustumsBuffer->Create(this, 64, frustumCountX * frustumCountY, false);
+	m_FrustumsDirty = true;
+	m_pLightGrid->Create(this, frustumCountX, frustumCountY, DXGI_FORMAT_R32G32_UINT, TextureUsage::ShaderResource | TextureUsage::UnorderedAccess, 1);
 
 	m_Viewport.Bottom = (float)m_WindowHeight;
 	m_Viewport.Right = (float)m_WindowWidth;
@@ -426,7 +601,7 @@ void Graphics::InitializeAssets()
 		m_pRootSignature->SetConstantBufferView(1, 1, D3D12_SHADER_VISIBILITY_ALL);
 		m_pRootSignature->SetConstantBufferView(2, 2, D3D12_SHADER_VISIBILITY_PIXEL);
 		m_pRootSignature->SetDescriptorTableSimple(3, 0, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, D3D12_SHADER_VISIBILITY_PIXEL);
-		m_pRootSignature->SetDescriptorTableSimple(4, 3, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, D3D12_SHADER_VISIBILITY_PIXEL);
+		m_pRootSignature->SetDescriptorTableSimple(4, 3, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, D3D12_SHADER_VISIBILITY_PIXEL);
 
 		D3D12_ROOT_SIGNATURE_FLAGS rootSignatureFlags =
 			D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
@@ -460,6 +635,7 @@ void Graphics::InitializeAssets()
 		m_pPipelineStateObject->SetVertexShader(vertexShader.GetByteCode(), vertexShader.GetByteCodeSize());
 		m_pPipelineStateObject->SetPixelShader(pixelShader.GetByteCode(), pixelShader.GetByteCodeSize());
 		m_pPipelineStateObject->SetRenderTargetFormat(RENDER_TARGET_FORMAT, DEPTH_STENCIL_FORMAT, m_SampleCount, m_SampleQuality);
+		m_pPipelineStateObject->SetDepthTest(D3D12_COMPARISON_FUNC_LESS_EQUAL);
 		m_pPipelineStateObject->Finalize(m_pDevice.Get());
 	}
 
@@ -486,11 +662,70 @@ void Graphics::InitializeAssets()
 		m_pShadowsPipelineStateObject->SetVertexShader(vertexShader.GetByteCode(), vertexShader.GetByteCodeSize());
 		m_pShadowsPipelineStateObject->SetRenderTargetFormats(nullptr, 0, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, 1, 0);
 		m_pShadowsPipelineStateObject->SetCullMode(D3D12_CULL_MODE_NONE);
-		m_pShadowsPipelineStateObject->SetDepthBias(0.0f, 0.0f, 4.0f);
+		m_pShadowsPipelineStateObject->SetDepthBias(0, 0.0f, 4.0f);
 		m_pShadowsPipelineStateObject->Finalize(m_pDevice.Get());
 
 		m_pShadowMap = std::make_unique<Texture2D>();
 		m_pShadowMap->Create(this, 4096, 4096, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, TextureUsage::DepthStencil | TextureUsage::ShaderResource, 1);
+	}
+
+	{
+		Shader vertexShader;
+		vertexShader.Load("Resources/Shadows.hlsl", Shader::Type::VertexShader, "VSMain");
+
+		//Rootsignature
+		m_pDepthPrepassRootSignature = std::make_unique<RootSignature>(1);
+		m_pDepthPrepassRootSignature->SetConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_VERTEX);
+
+		D3D12_ROOT_SIGNATURE_FLAGS rootSignatureFlags =
+			D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
+			D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
+			D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
+			D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS;
+
+		m_pDepthPrepassRootSignature->Finalize(m_pDevice.Get(), rootSignatureFlags);
+
+		//Pipeline state
+		m_pDepthPrepassPipelineStateObject = std::make_unique<GraphicsPipelineState>();
+		m_pDepthPrepassPipelineStateObject->SetInputLayout(inputElements, sizeof(inputElements) / sizeof(inputElements[0]));
+		m_pDepthPrepassPipelineStateObject->SetRootSignature(m_pDepthPrepassRootSignature->GetRootSignature());
+		m_pDepthPrepassPipelineStateObject->SetVertexShader(vertexShader.GetByteCode(), vertexShader.GetByteCodeSize());
+		m_pDepthPrepassPipelineStateObject->SetRenderTargetFormats(nullptr, 0, DEPTH_STENCIL_FORMAT, m_SampleCount, m_SampleQuality);
+		m_pDepthPrepassPipelineStateObject->Finalize(m_pDevice.Get());
+	}
+
+	{
+		Shader computeShader;
+		computeShader.Load("Resources/GenerateFrustums.hlsl", Shader::Type::ComputeShader, "CSMain");
+
+		m_pComputeGenerateFrustumsRootSignature = std::make_unique<RootSignature>(2);
+		m_pComputeGenerateFrustumsRootSignature->SetConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);
+		m_pComputeGenerateFrustumsRootSignature->SetDescriptorTableSimple(1, 0, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, D3D12_SHADER_VISIBILITY_ALL);
+		m_pComputeGenerateFrustumsRootSignature->Finalize(m_pDevice.Get(), D3D12_ROOT_SIGNATURE_FLAG_NONE);
+
+		m_pComputeGenerateFrustumsPipeline = std::make_unique<ComputePipelineState>();
+		m_pComputeGenerateFrustumsPipeline->SetComputeShader(computeShader.GetByteCode(), computeShader.GetByteCodeSize());
+		m_pComputeGenerateFrustumsPipeline->SetRootSignature(m_pComputeGenerateFrustumsRootSignature->GetRootSignature());
+		m_pComputeGenerateFrustumsPipeline->Finalize(m_pDevice.Get());
+
+		computeShader.Load("Resources/LightCulling.hlsl", Shader::Type::ComputeShader, "CSMain");
+
+		m_pComputeLightCullRootSignature = std::make_unique<RootSignature>(4);
+		m_pComputeLightCullRootSignature->SetConstantBufferView(0, 0, D3D12_SHADER_VISIBILITY_ALL);
+		m_pComputeLightCullRootSignature->SetConstantBufferView(1, 1, D3D12_SHADER_VISIBILITY_ALL);
+		m_pComputeLightCullRootSignature->SetDescriptorTableSimple(2, 0, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3, D3D12_SHADER_VISIBILITY_ALL);
+		m_pComputeLightCullRootSignature->SetDescriptorTableSimple(3, 0, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, D3D12_SHADER_VISIBILITY_ALL);
+		m_pComputeLightCullRootSignature->Finalize(m_pDevice.Get(), D3D12_ROOT_SIGNATURE_FLAG_NONE);
+
+		m_pComputeLightCullPipeline = std::make_unique<ComputePipelineState>();
+		m_pComputeLightCullPipeline->SetComputeShader(computeShader.GetByteCode(), computeShader.GetByteCodeSize());
+		m_pComputeLightCullPipeline->SetRootSignature(m_pComputeLightCullRootSignature->GetRootSignature());
+		m_pComputeLightCullPipeline->Finalize(m_pDevice.Get());
+
+		m_pLightIndexCounterBuffer = std::make_unique<StructuredBuffer>();
+		m_pLightIndexCounterBuffer->Create(this, sizeof(uint32), 1, false);
+		m_pLightIndexListBuffer = std::make_unique<StructuredBuffer>();
+		m_pLightIndexListBuffer->Create(this, sizeof(uint32), 720000, false);
 	}
 
 	//Geometry
@@ -510,12 +745,12 @@ void Graphics::UpdateImGui()
 	m_FrameTimes[m_FrameTimes.size() - 1] = GameTimer::DeltaTime();
 
 	ImGui::SetNextWindowPos(ImVec2(0, 0), 0, ImVec2(0, 0));
-	ImGui::SetNextWindowSize(ImVec2(250, m_WindowHeight));
+	ImGui::SetNextWindowSize(ImVec2(250, (float)m_WindowHeight));
 	ImGui::Begin("GPU Stats", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
 	ImGui::Text("MS: %.4f", GameTimer::DeltaTime());
 	ImGui::SameLine(100);
 	ImGui::Text("FPS: %.1f", 1.0f / GameTimer::DeltaTime());
-	ImGui::PlotLines("Frametime", m_FrameTimes.data(), m_FrameTimes.size(), 0, 0, 0.0f, 0.03f, ImVec2(200, 100));
+	ImGui::PlotLines("Frametime", m_FrameTimes.data(), (int)m_FrameTimes.size(), 0, 0, 0.0f, 0.03f, ImVec2(200, 100));
 	ImGui::BeginTabBar("GpuStatsBar");
 	if (ImGui::BeginTabItem("Descriptor Heaps"))
 	{

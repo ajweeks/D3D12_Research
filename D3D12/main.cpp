@@ -12,7 +12,7 @@ public:
 	{
 		MakeWindow(pTitle);
 
-		m_pGraphics = std::make_unique<Graphics>(gWindowWidth, gWindowHeight, 4);
+		m_pGraphics = std::make_unique<Graphics>(gWindowWidth, gWindowHeight, 1);
 		m_pGraphics->Initialize(m_Window);
 
 		GameTimer::Reset();
@@ -80,12 +80,12 @@ private:
 		}
 		case WM_KEYUP:
 		{
-			Input::Instance().UpdateKey(wParam, false);
+			Input::Instance().UpdateKey((uint32)wParam, false);
 			return 0;
 		}
 		case WM_KEYDOWN:
 		{
-			Input::Instance().UpdateKey(wParam, true);
+			Input::Instance().UpdateKey((uint32)wParam, true);
 			return 0;
 		}
 		case WM_DESTROY:
